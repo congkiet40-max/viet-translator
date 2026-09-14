@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 sub_doc_app.py - GUI dịch phụ đề & tài liệu sang Tiếng Việt
-v4.0 - Integrated Engine Selector (Google / Gemini Cloud API / Local AI), Progress Bar, SOTA Layout
+v4.5 - Support DeepL, DeepSeek, OpenAI, Gemini, Google, Ollama
 """
 import os, sys, glob, subprocess, threading, json
 from pathlib import Path
@@ -25,7 +25,7 @@ def load_config() -> dict:
                 return json.load(f)
     except Exception:
         pass
-    return {"engine": "gemini", "gemini_key": ""}
+    return {"engine": "deepl", "api_key": ""}
 
 def save_config(cfg: dict):
     try:
@@ -41,8 +41,8 @@ class TranslatorApp(ctk.CTk):
         super().__init__()
 
         self.title("Bộ Dịch Phụ Đề & Sách Ngoại Văn (Eng/Rus ➔ Tiếng Việt)")
-        self.geometry("820x720")
-        self.minsize(720, 620)
+        self.geometry("860x740")
+        self.minsize(760, 640)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.cfg = load_config()
@@ -59,49 +59,60 @@ class TranslatorApp(ctk.CTk):
         ef = ctk.CTkFrame(self, corner_radius=10, fg_color="#1e222a")
         ef.pack(padx=20, pady=5, fill="x")
 
-        ctk.CTkLabel(ef, text="⚙️ LỰA CHỌN ENGINE DỊCH (Tự do tùy chọn trước mỗi lượt dịch):",
-                     font=ctk.CTkFont(size=12, weight="bold"), text_color="#38d9a9").pack(anchor="w", padx=12, pady=(8, 4))
+        top_ef = ctk.CTkFrame(ef, fg_color="transparent")
+        top_ef.pack(fill="x", padx=12, pady=(8, 2))
 
-        radio_frame = ctk.CTkFrame(ef, fg_color="transparent")
-        radio_frame.pack(fill="x", padx=10, pady=2)
+        ctk.CTkLabel(top_ef, text="⚙️ CHỌN ENGINE DỊCH (DeepL / DeepSeek / OpenAI / Gemini / Google / Ollama):",
+                     font=ctk.CTkFont(size=12, weight="bold"), text_color="#38d9a9").pack(side="left")
 
-        self.engine_var = tk.StringVar(value=self.cfg.get("engine", "google"))
-
-        r1 = ctk.CTkRadioButton(
-            radio_frame, text="⚡ Google Translate (Miễn phí - Nhanh, không cần Key)",
-            variable=self.engine_var, value="google", command=self._on_engine_change
+        # Engine Dropdown Menu
+        self.engine_option = ctk.CTkOptionMenu(
+            top_ef,
+            values=[
+                "👑 DeepL (Vua Dịch Sách - Mượt nhất thế giới)",
+                "🐉 DeepSeek AI (Dịch văn phong Châu Á cực đỉnh)",
+                "🤖 OpenAI GPT-4o (Chuẩn mượt)",
+                "🔑 Gemini AI (Google Cloud)",
+                "⚡ Google Translate (Nhanh & Miễn phí)",
+                "🔒 Local AI / Ollama (Offline)"
+            ],
+            command=self._on_engine_select,
+            width=360
         )
-        r1.pack(side="left", padx=10, pady=4)
+        self.engine_option.pack(side="right", padx=6)
 
-        r2 = ctk.CTkRadioButton(
-            radio_frame, text="🔑 Gemini Cloud API (Dịch Sách Cao Cấp - Chuẩn mượt)",
-            variable=self.engine_var, value="gemini", command=self._on_engine_change
-        )
-        r2.pack(side="left", padx=10, pady=4)
+        # Map display name to service code
+        self.svc_map = {
+            "👑 DeepL (Vua Dịch Sách - Mượt nhất thế giới)": "deepl",
+            "🐉 DeepSeek AI (Dịch văn phong Châu Á cực đỉnh)": "deepseek",
+            "🤖 OpenAI GPT-4o (Chuẩn mượt)": "openai",
+            "🔑 Gemini AI (Google Cloud)": "gemini",
+            "⚡ Google Translate (Nhanh & Miễn phí)": "google",
+            "🔒 Local AI / Ollama (Offline)": "ollama",
+        }
+        self.code_to_name = {v: k for k, v in self.svc_map.items()}
 
-        r3 = ctk.CTkRadioButton(
-            radio_frame, text="🔒 Local AI / Ollama (Offline)",
-            variable=self.engine_var, value="ollama", command=self._on_engine_change
-        )
-        r3.pack(side="left", padx=10, pady=4)
+        init_code = self.cfg.get("engine", "deepl")
+        if init_code in self.code_to_name:
+            self.engine_option.set(self.code_to_name[init_code])
 
-        # API Key Entry Row (collapsible / enabled when Gemini chosen)
+        # API Key Entry Row
         self.key_frame = ctk.CTkFrame(ef, fg_color="transparent")
-        self.key_frame.pack(fill="x", padx=12, pady=(2, 8))
+        self.key_frame.pack(fill="x", padx=12, pady=(4, 8))
 
-        ctk.CTkLabel(self.key_frame, text="🔑 Gemini API Key:", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 6))
-        self.key_entry = ctk.CTkEntry(self.key_frame, placeholder_text="Nhập API Key miễn phí từ Google...", width=320)
-        self.key_entry.insert(0, self.cfg.get("gemini_key", ""))
+        self.key_label = ctk.CTkLabel(self.key_frame, text="🔑 API Key (nếu có):", font=ctk.CTkFont(size=11))
+        self.key_label.pack(side="left", padx=(0, 6))
+
+        self.key_entry = ctk.CTkEntry(self.key_frame, placeholder_text="Nhập API Key (DeepL / DeepSeek / OpenAI / Gemini)...", width=380)
+        self.key_entry.insert(0, self.cfg.get("api_key", ""))
         self.key_entry.pack(side="left", padx=4)
 
         btn_get_key = ctk.CTkButton(
-            self.key_frame, text="🔗 Lấy Key Miễn Phí (1-Click)", width=170,
+            self.key_frame, text="🔗 HD Lấy Key Miễn Phí", width=150,
             fg_color="#0c8599", hover_color="#0b7285", font=ctk.CTkFont(size=11),
-            command=self._open_gemini_key_page
+            command=self._open_key_help
         )
         btn_get_key.pack(side="left", padx=6)
-
-        self._on_engine_change()
 
         # ── Progress bar (always visible below header) ───────────────────────
         self._progress_var = tk.DoubleVar(value=0)
@@ -126,30 +137,41 @@ class TranslatorApp(ctk.CTk):
         self.log_box = ctk.CTkTextbox(lf, height=100, font=ctk.CTkFont(family="monospace", size=11))
         self.log_box.pack(padx=10, pady=6, fill="x")
 
-    def _open_gemini_key_page(self):
+    def _open_key_help(self):
+        code = self.get_selected_service()
+        urls = {
+            "deepl": "https://www.deepl.com/pro-api",
+            "deepseek": "https://platform.deepseek.com/",
+            "openai": "https://platform.openai.com/api-keys",
+            "gemini": "https://aistudio.google.com/app/apikey"
+        }
+        url = urls.get(code, "https://github.com/congkiet40-max/viet-translator")
         try:
-            subprocess.Popen(["xdg-open", "https://aistudio.google.com/app/apikey"])
+            subprocess.Popen(["xdg-open", url])
         except Exception:
             pass
 
-    def _on_engine_change(self):
-        eng = self.engine_var.get()
-        self.cfg["engine"] = eng
+    def _on_engine_select(self, choice):
+        code = self.svc_map.get(choice, "deepl")
+        self.cfg["engine"] = code
         save_config(self.cfg)
-        if eng == "gemini":
-            self.key_entry.configure(state="normal")
-        else:
-            # Leave entry readable
-            self.key_entry.configure(state="normal")
 
     def get_selected_service(self) -> str:
-        eng = self.engine_var.get()
+        choice = self.engine_option.get()
+        code = self.svc_map.get(choice, "deepl")
         key = self.key_entry.get().strip()
         if key:
-            os.environ["GEMINI_API_KEY"] = key
-            self.cfg["gemini_key"] = key
+            if code == "deepl":
+                os.environ["DEEPL_AUTH_KEY"] = key
+            elif code == "deepseek":
+                os.environ["DEEPSEEK_API_KEY"] = key
+            elif code == "openai":
+                os.environ["OPENAI_API_KEY"] = key
+            elif code == "gemini":
+                os.environ["GEMINI_API_KEY"] = key
+            self.cfg["api_key"] = key
             save_config(self.cfg)
-        return eng
+        return code
 
     # ── Helpers ─────────────────────────────────────────────────────────────
     def _on_close(self):
@@ -427,7 +449,7 @@ class TranslatorApp(ctk.CTk):
                 if sub: cmd.append(f"--sub-file={sub}")
             subprocess.Popen(cmd)
         except Exception as e:
-            self.log(f"❌ Không mở me: {e}")
+            self.log(f"❌ Không mở được: {e}")
 
 
 if __name__ == "__main__":
