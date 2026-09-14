@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-doc_translator.py - Bộ dịch PDF/DOCX siêu tốc sang Tiếng Việt
-v4.0 - Layout-Aware: span-level color, word-wrap, line-gap preservation
+doc_translator.py - Bộ dịch PDF/DOCX siêu tốc & Bố cục SOTA cho Tiếng Việt
+v5.0 - Integrated SOTA Layout Engine (pdf2zh / DocLayout-YOLO) + PyMuPDF fallback
 """
-import os, sys, re, io, json, time
+import os, sys, re, io, json, time, subprocess, shutil
 import urllib.request, urllib.parse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,7 +11,78 @@ from PIL import Image, ImageDraw, ImageFont
 import pymupdf
 from docx import Document
 
-# ─── FONT SETUP ────────────────────────────────────────────────────────────────
+# ─── SOTA ENGINE INTEGRATION (pdf2zh) ─────────────────────────────────────────
+def is_pdf2zh_available() -> bool:
+    """Kiểm tra xem engine pdf2zh có sẵn trên hệ thống không."""
+    return shutil.which("pdf2zh") is not None or shutil.which("pdf2zh.exe") is not None
+
+def translate_pdf_sota(
+    pdf_path: str,
+    output_pdf_path: str = None,
+    service: str = 'google',
+    lang_in: str = 'en',
+    lang_out: str = 'vi',
+    thread: int = 4
+) -> str:
+    """
+    Dịch PDF bằng engine pdf2zh (DocLayout-YOLO):
+    Giữ 100% bố cục, font chữ, hình ảnh, bảng biểu & công thức toán.
+    """
+    p = Path(pdf_path).resolve()
+    if output_pdf_path is None:
+        output_pdf_path = str(p.with_name(f"{p.stem}_TiengViet.pdf"))
+
+    print(f"\n🚀 [SOTA Engine: pdf2zh + DocLayout-YOLO] Đang dịch: {p.name}")
+    print(f"   Service: {service.upper()} | Ngôn ngữ: {lang_in} -> {lang_out}")
+
+    cmd = [
+        "pdf2zh",
+        str(p),
+        "-li", lang_in,
+        "-lo", lang_out,
+        "-s", service,
+        "-t", str(thread)
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # pdf2zh generates files with suffix e.g. filename.mono.pdf or filename.dual.pdf
+        # Let's find generated output file in the same directory
+        stem = p.stem
+        parent = p.parent
+        possible_outputs = [
+            parent / f"{stem}.mono.pdf",
+            parent / f"{stem}_mono.pdf",
+            parent / f"{stem}.dual.pdf",
+        ]
+
+        found_out = None
+        for po in possible_outputs:
+            if po.exists():
+                found_out = po
+                break
+
+        if not found_out:
+            # Search for newest created pdf with stem in name
+            matched = list(parent.glob(f"{stem}*.pdf"))
+            matched = [f for f in matched if f.resolve() != p]
+            if matched:
+                found_out = max(matched, key=lambda f: f.stat().st_mtime)
+
+        if found_out:
+            shutil.move(str(found_out), output_pdf_path)
+            print(f"✅ Đã tạo PDF bản dịch chuẩn SOTA: {output_pdf_path}\n")
+            return output_pdf_path
+        else:
+            print("⚠️ Không tìm thấy file đầu ra từ pdf2zh, chuyển sang fallback engine...", file=sys.stderr)
+            return translate_pdf_fallback(pdf_path, output_pdf_path)
+
+    except Exception as e:
+        print(f"⚠️ Lỗi khi chạy pdf2zh ({e}). Đang chuyển sang Fallback engine (PyMuPDF)...", file=sys.stderr)
+        return translate_pdf_fallback(pdf_path, output_pdf_path)
+
+
+# ─── FALLBACK ENGINE (PyMuPDF Custom Overlay) ─────────────────────────────────
 _FONT_VARIANTS = {
     'regular':     '/usr/share/fonts/google-carlito-fonts/Carlito-Regular.ttf',
     'bold':        '/usr/share/fonts/google-carlito-fonts/Carlito-Bold.ttf',
@@ -40,8 +111,6 @@ def get_font(size: int, bold=False, italic=False) -> ImageFont.FreeTypeFont:
             _font_cache[key] = ImageFont.load_default()
     return _font_cache[key]
 
-
-# ─── SKIP RULES ───────────────────────────────────────────────────────────────
 _CHORD_RE = re.compile(r'^[A-G][b#]?(maj7?|min7?|m7?|dim7?|aug|sus[24]?|add\d|7|9|11|13)?(\/[A-G][b#]?)?$', re.I)
 _PAGE_NUM_RE = re.compile(r'^\d{1,4}(-\d{1,4})?$')
 
@@ -51,16 +120,12 @@ def _skip(text: str) -> bool:
         return True
     if t.isdigit() or _PAGE_NUM_RE.match(t):
         return True
-    # Chord symbol: very short, starts with A-G
     if len(t) <= 7 and _CHORD_RE.match(t):
         return True
-    # Pure punctuation / copyright
     if all(c in '©®™°•·-–—_|/\\' for c in t):
         return True
     return False
 
-
-# ─── TRANSLATE ENGINE ─────────────────────────────────────────────────────────
 _trans_cache: dict = {}
 _DELIM = "\n|||SPLIT|||\n"
 
@@ -120,41 +185,30 @@ def batch_translate(texts: list, target: str = 'vi') -> list:
 
     return results
 
-
-# ─── BACKGROUND SAMPLER ───────────────────────────────────────────────────────
 def sample_bg(img: Image.Image, x0, y0, x1, y1) -> tuple:
-    """Sample background color by taking pixel median from top/bottom strips."""
     try:
         w, h = img.size
         xi0, yi0 = max(0, int(x0)), max(0, int(y0))
         xi1, yi1 = min(w - 1, int(x1)), min(h - 1, int(y1))
         if xi0 >= xi1 or yi0 >= yi1:
             return (255, 255, 255)
-
         px = img.load()
         samples = []
-        # top strip (1-pixel tall above text)
         strip_y = max(0, yi0 - 1)
         for x in range(xi0, min(xi1, xi0 + 20)):
             p = px[x, strip_y]
             samples.append(p[:3] if len(p) >= 3 else (255, 255, 255))
-        # also corners
         for cx, cy in [(xi0, yi0), (xi1, yi0), (xi0, yi1), (xi1, yi1)]:
             cx, cy = max(0, min(cx, w-1)), max(0, min(cy, h-1))
             p = px[cx, cy]
             samples.append(p[:3] if len(p) >= 3 else (255, 255, 255))
-
         if not samples:
             return (255, 255, 255)
-        avg = tuple(sum(c[i] for c in samples) // len(samples) for i in range(3))
-        return avg
+        return tuple(sum(c[i] for c in samples) // len(samples) for i in range(3))
     except Exception:
         return (255, 255, 255)
 
-
-# ─── TEXT WRAP ────────────────────────────────────────────────────────────────
 def wrap_text(draw: ImageDraw.Draw, text: str, font: ImageFont.FreeTypeFont, max_width: float) -> list:
-    """Wrap text to fit within max_width. Returns list of lines."""
     words = text.split()
     if not words:
         return ['']
@@ -170,44 +224,21 @@ def wrap_text(draw: ImageDraw.Draw, text: str, font: ImageFont.FreeTypeFont, max
     lines.append(current)
     return lines
 
-
-# ─── DRAW TRANSLATED BLOCK ────────────────────────────────────────────────────
-def draw_translated_block(
-    draw: ImageDraw.Draw,
-    img: Image.Image,
-    x0: float, y0: float, x1: float, y1: float,
-    trans_text: str,
-    orig_size: int,    # already zoom-scaled
-    bold: bool, italic: bool,
-    rgb: tuple,
-    line_height: float  # original line height in px (zoom-scaled)
-):
-    """
-    Erase the original bounding box and draw the translated text.
-    If translated text is wider, automatically wrap or shrink font.
-    Erase area is extended if wrapped text needs extra lines.
-    """
+def draw_translated_block(draw, img, x0, y0, x1, y1, trans_text, orig_size, bold, italic, rgb, line_height):
     bbox_w = x1 - x0
     if bbox_w <= 0:
         return
-
     font = get_font(orig_size, bold=bold, italic=italic)
-
-    # Try to fit on one line first (shrink font if needed)
     text_w = draw.textlength(trans_text, font=font)
     if text_w <= bbox_w * 1.05:
-        # Fits in original line — single line draw
         bg = sample_bg(img, x0, y0, x1, y1)
         draw.rectangle([x0 - 1, y0, x1 + 1, y1 + 1], fill=bg)
         draw.text((x0, y0), trans_text, fill=rgb, font=font)
         return
 
-    # Try word wrapping at original font size
     wrapped = wrap_text(draw, trans_text, font, bbox_w * 1.02)
-    line_h = line_height  # use original line height as row height
-
+    line_h = line_height
     if len(wrapped) <= 3:
-        # Wrap works — erase enough vertical space
         total_h = line_h * len(wrapped)
         bg = sample_bg(img, x0, y0, x1, y0 + total_h + 2)
         draw.rectangle([x0 - 1, y0, x1 + 1, y0 + total_h + 2], fill=bg)
@@ -215,29 +246,19 @@ def draw_translated_block(
             draw.text((x0, y0 + i * line_h), wline, fill=rgb, font=font)
         return
 
-    # Last resort: shrink font to fit on one line
     shrunk_size = max(int(orig_size * bbox_w / text_w) - 1, 6)
     font = get_font(shrunk_size, bold=bold, italic=italic)
     bg = sample_bg(img, x0, y0, x1, y1)
     draw.rectangle([x0 - 1, y0, x1 + 1, y1 + 1], fill=bg)
     draw.text((x0, y0), trans_text, fill=rgb, font=font)
 
-
-# ─── PAGE RENDERER ────────────────────────────────────────────────────────────
 def render_page(page: pymupdf.Page, page_idx: int, total: int, zoom: float = 2.5, target: str = 'vi') -> io.BytesIO:
-    """Render one PDF page with layout-aware translation overlay."""
     print(f"  Trang {page_idx}/{total}...", flush=True)
-
     mat = pymupdf.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     draw = ImageDraw.Draw(img)
-
     page_dict = page.get_text("dict")
-
-    # ── Collect translatable span groups (one per visible text line) ─────────
-    # We process at SPAN level to preserve per-span color (red chords, etc.)
-    # But translate at LINE level (joins spans) for natural sentence context.
 
     class LineInfo:
         __slots__ = ('x0','y0','x1','y1','text','size','bold','italic','rgb','line_h','translated')
@@ -261,41 +282,28 @@ def render_page(page: pymupdf.Page, page_idx: int, total: int, zoom: float = 2.5
             spans = line.get("spans", [])
             if not spans:
                 continue
-
-            # Build line text from all spans
             line_text = "".join(s.get("text", "") for s in spans).strip()
             if not line_text or len(line_text) < 2:
                 continue
-
-            # Bounding box (zoom-scaled)
             x0 = min(s["bbox"][0] for s in spans) * zoom
             y0 = min(s["bbox"][1] for s in spans) * zoom
             x1 = max(s["bbox"][2] for s in spans) * zoom
             y1 = max(s["bbox"][3] for s in spans) * zoom
-
-            # Estimate line height from this line + next (for wrap spacing)
             if li + 1 < len(block_lines):
                 next_spans = block_lines[li + 1].get("spans", [])
-                if next_spans:
-                    next_y0 = min(s["bbox"][1] for s in next_spans) * zoom
-                    line_h = max(next_y0 - y0, y1 - y0)
-                else:
-                    line_h = y1 - y0
+                line_h = (min(s["bbox"][1] for s in next_spans) * zoom - y0) if next_spans else (y1 - y0)
             else:
                 line_h = y1 - y0
-            line_h = max(line_h, y1 - y0)  # at minimum the bbox height
+            line_h = max(line_h, y1 - y0)
 
-            # Use first span for primary styling
             first = spans[0]
             c_int = first.get("color", 0)
             rgb = ((c_int >> 16) & 255, (c_int >> 8) & 255, c_int & 255)
-            # PDF font size → pixel size at zoom
             pdf_size = first.get("size", 10)
             px_size = max(int(pdf_size * zoom * 0.90), 7)
             flags = first.get("flags", 0)
             bold   = bool(flags & 2)
             italic = bool(flags & 1)
-
             lines.append(LineInfo(x0, y0, x1, y1, line_text, px_size, bold, italic, rgb, line_h))
 
     if not lines:
@@ -304,41 +312,28 @@ def render_page(page: pymupdf.Page, page_idx: int, total: int, zoom: float = 2.5
         buf.seek(0)
         return buf
 
-    # ── Batch-translate all line texts ───────────────────────────────────────
     translated = batch_translate([ln.text for ln in lines], target=target)
     for ln, tr in zip(lines, translated):
         ln.translated = tr or ln.text
 
-    # ── Overlay: process in top-to-bottom order ──────────────────────────────
-    # Sort by y0 so wrap-expanded erase doesn't overlap lines drawn later
     lines.sort(key=lambda ln: (ln.y0, ln.x0))
-
     for ln in lines:
-        draw_translated_block(
-            draw, img,
-            ln.x0, ln.y0, ln.x1, ln.y1,
-            ln.translated,
-            ln.size, ln.bold, ln.italic, ln.rgb,
-            ln.line_h
-        )
+        draw_translated_block(draw, img, ln.x0, ln.y0, ln.x1, ln.y1, ln.translated, ln.size, ln.bold, ln.italic, ln.rgb, ln.line_h)
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=93)
     buf.seek(0)
     return buf
 
-
-# ─── MAIN PDF TRANSLATOR ──────────────────────────────────────────────────────
-def translate_pdf_file(pdf_path: str, output_pdf_path: str = None, workers: int = 3) -> str:
+def translate_pdf_fallback(pdf_path: str, output_pdf_path: str = None, workers: int = 3) -> str:
     p = Path(pdf_path)
     if output_pdf_path is None:
         output_pdf_path = str(p.with_name(p.stem + "_TiengViet.pdf"))
 
     doc = pymupdf.open(pdf_path)
     total = len(doc)
-    print(f"\n📄 {p.name} ({total} trang)")
+    print(f"\n📄 [Fallback Engine: PyMuPDF] {p.name} ({total} trang)")
     doc_out = pymupdf.open()
-
     page_bufs: dict[int, io.BytesIO] = {}
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -364,6 +359,11 @@ def translate_pdf_file(pdf_path: str, output_pdf_path: str = None, workers: int 
     print(f"✅ Đã tạo: {output_pdf_path}\n")
     return output_pdf_path
 
+def translate_pdf_file(pdf_path: str, output_pdf_path: str = None, service: str = 'google') -> str:
+    if is_pdf2zh_available():
+        return translate_pdf_sota(pdf_path, output_pdf_path, service=service)
+    else:
+        return translate_pdf_fallback(pdf_path, output_pdf_path)
 
 # ─── DOCX TRANSLATOR ─────────────────────────────────────────────────────────
 def translate_docx_file(docx_path: str, output_docx_path: str = None) -> str:
@@ -384,16 +384,16 @@ def translate_docx_file(docx_path: str, output_docx_path: str = None) -> str:
     print(f"✅ Đã lưu: {output_docx_path}\n")
     return output_docx_path
 
-
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         fp = sys.argv[1]
+        svc = sys.argv[2] if len(sys.argv) > 2 else 'google'
         if fp.lower().endswith('.pdf'):
-            translate_pdf_file(fp)
+            translate_pdf_file(fp, service=svc)
         elif fp.lower().endswith('.docx'):
             translate_docx_file(fp)
         else:
             print("❌ Chỉ hỗ trợ .pdf hoặc .docx")
     else:
-        print("Sử dụng: python3 doc_translator.py <path_to_pdf_or_docx>")
+        print("Sử dụng: python3 doc_translator.py <path_to_pdf_or_docx> [service_name]")
