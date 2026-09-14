@@ -142,7 +142,7 @@ class TranslatorApp(ctk.CTk):
             # Leave entry readable
             self.key_entry.configure(state="normal")
 
-    def get_selected_service((self) -> str:
+    def get_selected_service(self) -> str:
         eng = self.engine_var.get()
         key = self.key_entry.get().strip()
         if key:
