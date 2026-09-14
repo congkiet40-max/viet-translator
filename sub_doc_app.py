@@ -25,7 +25,7 @@ def load_config() -> dict:
                 return json.load(f)
     except Exception:
         pass
-    return {"engine": "google", "gemini_key": ""}
+    return {"engine": "gemini", "gemini_key": ""}
 
 def save_config(cfg: dict):
     try:
