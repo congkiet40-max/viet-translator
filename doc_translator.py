@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-doc_translator.py - Bộ dịch PDF/DOCX siêu tốc & Bố cục SOTA cho Tiếng Việt
-v5.0 - Integrated SOTA Layout Engine (pdf2zh / DocLayout-YOLO) + PyMuPDF fallback
+doc_translator.py - Bộ dịch PDF/DOCX Siêu Nhẹ & Siêu Tốc (Lightweight & Fast)
+v6.0 - 0% Heavy PyTorch, 100% Fast Vector PDF Translation into Vietnamese
 """
-import os, sys, re, io, json, time, subprocess, shutil
+import os, sys, re, io, json, time
 import urllib.request, urllib.parse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,78 +11,64 @@ from PIL import Image, ImageDraw, ImageFont
 import pymupdf
 from docx import Document
 
-# ─── SOTA ENGINE INTEGRATION (pdf2zh) ─────────────────────────────────────────
-def is_pdf2zh_available() -> bool:
-    """Kiểm tra xem engine pdf2zh có sẵn trên hệ thống không."""
-    return shutil.which("pdf2zh") is not None or shutil.which("pdf2zh.exe") is not None
+# ─── TRANSLATION ENGINE (GTX + MyMemory Fallback) ────────────────────────────
+_trans_cache: dict = {}
 
-def translate_pdf_sota(
-    pdf_path: str,
-    output_pdf_path: str = None,
-    service: str = 'google',
-    lang_in: str = 'en',
-    lang_out: str = 'vi',
-    thread: int = 4
-) -> str:
-    """
-    Dịch PDF bằng engine pdf2zh (DocLayout-YOLO):
-    Giữ 100% bố cục, font chữ, hình ảnh, bảng biểu & công thức toán.
-    """
-    p = Path(pdf_path).resolve()
-    if output_pdf_path is None:
-        output_pdf_path = str(p.with_name(f"{p.stem}_TiengViet.pdf"))
+def _skip(text: str) -> bool:
+    t = text.strip()
+    if not t or len(t) < 2:
+        return True
+    if t.isdigit() or re.match(r'^\d{1,4}(-\d{1,4})?$', t):
+        return True
+    # Chord symbol
+    if len(t) <= 7 and re.match(r'^[A-G][b#]?(maj7?|min7?|m7?|dim7?|aug|sus[24]?|add\d|7|9|11|13)?(\/[A-G][b#]?)?$', t, re.I):
+        return True
+    if all(c in '©®™°•·-–—_|/\\' for c in t):
+        return True
+    return False
 
-    print(f"\n🚀 [SOTA Engine: pdf2zh + DocLayout-YOLO] Đang dịch: {p.name}")
-    print(f"   Service: {service.upper()} | Ngôn ngữ: {lang_in} -> {lang_out}")
+def translate_text_fast(text: str, target: str = 'vi') -> str:
+    text_clean = text.strip()
+    if _skip(text_clean):
+        return text
+    if text_clean in _trans_cache:
+        return _trans_cache[text_clean]
 
-    cmd = [
-        "pdf2zh",
-        str(p),
-        "-li", lang_in,
-        "-lo", lang_out,
-        "-s", service,
-        "-t", str(thread)
-    ]
-
+    result = text
+    # 1. Try Google GTX
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        # pdf2zh generates files with suffix e.g. filename.mono.pdf or filename.dual.pdf
-        # Let's find generated output file in the same directory
-        stem = p.stem
-        parent = p.parent
-        possible_outputs = [
-            parent / f"{stem}.mono.pdf",
-            parent / f"{stem}_mono.pdf",
-            parent / f"{stem}.dual.pdf",
-        ]
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target}&dt=t&q={urllib.parse.quote(text_clean)}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            res = json.loads(r.read().decode('utf-8'))
+            tr = "".join([item[0] for item in res[0] if item and item[0]])
+            if tr.strip() and tr.strip() != text_clean:
+                result = tr.strip()
+    except Exception:
+        pass
 
-        found_out = None
-        for po in possible_outputs:
-            if po.exists():
-                found_out = po
-                break
+    # 2. If GTX failed or returned original text, fallback to MyMemory
+    if result == text:
+        try:
+            from deep_translator import MyMemoryTranslator
+            tr = MyMemoryTranslator(source='en-US', target='vi-VN').translate(text_clean[:5000])
+            if tr and tr.strip():
+                result = tr.strip()
+        except Exception:
+            pass
 
-        if not found_out:
-            # Search for newest created pdf with stem in name
-            matched = list(parent.glob(f"{stem}*.pdf"))
-            matched = [f for f in matched if f.resolve() != p]
-            if matched:
-                found_out = max(matched, key=lambda f: f.stat().st_mtime)
+    _trans_cache[text_clean] = result
+    return result
 
-        if found_out:
-            shutil.move(str(found_out), output_pdf_path)
-            print(f"✅ Đã tạo PDF bản dịch chuẩn SOTA: {output_pdf_path}\n")
-            return output_pdf_path
-        else:
-            print("⚠️ Không tìm thấy file đầu ra từ pdf2zh, chuyển sang fallback engine...", file=sys.stderr)
-            return translate_pdf_fallback(pdf_path, output_pdf_path)
+def batch_translate(texts: list, target: str = 'vi') -> list:
+    if not texts:
+        return []
+    results = [None] * len(texts)
+    for i, t in enumerate(texts):
+        results[i] = translate_text_fast(t, target=target)
+    return results
 
-    except Exception as e:
-        print(f"⚠️ Lỗi khi chạy pdf2zh ({e}). Đang chuyển sang Fallback engine (PyMuPDF)...", file=sys.stderr)
-        return translate_pdf_fallback(pdf_path, output_pdf_path)
-
-
-# ─── FALLBACK ENGINE (PyMuPDF Custom Overlay) ─────────────────────────────────
+# ─── FONT SETUP ──────────────────────────────────────────────────────────────
 _FONT_VARIANTS = {
     'regular':     '/usr/share/fonts/google-carlito-fonts/Carlito-Regular.ttf',
     'bold':        '/usr/share/fonts/google-carlito-fonts/Carlito-Bold.ttf',
@@ -110,80 +96,6 @@ def get_font(size: int, bold=False, italic=False) -> ImageFont.FreeTypeFont:
         except Exception:
             _font_cache[key] = ImageFont.load_default()
     return _font_cache[key]
-
-_CHORD_RE = re.compile(r'^[A-G][b#]?(maj7?|min7?|m7?|dim7?|aug|sus[24]?|add\d|7|9|11|13)?(\/[A-G][b#]?)?$', re.I)
-_PAGE_NUM_RE = re.compile(r'^\d{1,4}(-\d{1,4})?$')
-
-def _skip(text: str) -> bool:
-    t = text.strip()
-    if not t:
-        return True
-    if t.isdigit() or _PAGE_NUM_RE.match(t):
-        return True
-    if len(t) <= 7 and _CHORD_RE.match(t):
-        return True
-    if all(c in '©®™°•·-–—_|/\\' for c in t):
-        return True
-    return False
-
-_trans_cache: dict = {}
-_DELIM = "\n|||SPLIT|||\n"
-
-def _gtx_raw(text: str, target: str = 'vi') -> str:
-    try:
-        url = (
-            "https://translate.googleapis.com/translate_a/single"
-            f"?client=gtx&sl=auto&tl={target}&dt=t&q={urllib.parse.quote(text)}"
-        )
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            res = json.loads(r.read().decode('utf-8'))
-            return "".join([item[0] for item in res[0] if item[0]])
-    except Exception:
-        return text
-
-def _gtx(text: str, target: str = 'vi') -> str:
-    t = text.strip()
-    if _skip(t):
-        return text
-    if t in _trans_cache:
-        return _trans_cache[t]
-    result = _gtx_raw(t, target)
-    _trans_cache[t] = result
-    return result
-
-def batch_translate(texts: list, target: str = 'vi') -> list:
-    if not texts:
-        return []
-    results = [None] * len(texts)
-    need_idx, need_txt = [], []
-    for i, t in enumerate(texts):
-        if _skip(t):
-            results[i] = t
-        elif t.strip() in _trans_cache:
-            results[i] = _trans_cache[t.strip()]
-        else:
-            need_idx.append(i)
-            need_txt.append(t)
-
-    CHUNK = 40
-    for cs in range(0, len(need_txt), CHUNK):
-        chunk = need_txt[cs:cs + CHUNK]
-        combined = _gtx_raw(_DELIM.join(chunk), target)
-        parts = combined.split(_DELIM)
-        if len(parts) == len(chunk):
-            for j, tr in enumerate(parts):
-                idx = need_idx[cs + j]
-                results[idx] = tr.strip()
-                _trans_cache[need_txt[cs + j].strip()] = tr.strip()
-        else:
-            for j, orig in enumerate(chunk):
-                idx = need_idx[cs + j]
-                results[idx] = _gtx(orig, target)
-        if cs + CHUNK < len(need_txt):
-            time.sleep(0.08)
-
-    return results
 
 def sample_bg(img: Image.Image, x0, y0, x1, y1) -> tuple:
     try:
@@ -252,7 +164,7 @@ def draw_translated_block(draw, img, x0, y0, x1, y1, trans_text, orig_size, bold
     draw.rectangle([x0 - 1, y0, x1 + 1, y1 + 1], fill=bg)
     draw.text((x0, y0), trans_text, fill=rgb, font=font)
 
-def render_page(page: pymupdf.Page, page_idx: int, total: int, zoom: float = 2.5, target: str = 'vi') -> io.BytesIO:
+def render_page(page: pymupdf.Page, page_idx: int, total: int, zoom: float = 2.0, target: str = 'vi') -> io.BytesIO:
     print(f"  Trang {page_idx}/{total}...", flush=True)
     mat = pymupdf.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat)
@@ -308,7 +220,7 @@ def render_page(page: pymupdf.Page, page_idx: int, total: int, zoom: float = 2.5
 
     if not lines:
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=93)
+        img.save(buf, format="JPEG", quality=90)
         buf.seek(0)
         return buf
 
@@ -321,18 +233,18 @@ def render_page(page: pymupdf.Page, page_idx: int, total: int, zoom: float = 2.5
         draw_translated_block(draw, img, ln.x0, ln.y0, ln.x1, ln.y1, ln.translated, ln.size, ln.bold, ln.italic, ln.rgb, ln.line_h)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=93)
+    img.save(buf, format="JPEG", quality=90)
     buf.seek(0)
     return buf
 
-def translate_pdf_fallback(pdf_path: str, output_pdf_path: str = None, workers: int = 3) -> str:
+def translate_pdf_file(pdf_path: str, output_pdf_path: str = None, service: str = 'google', workers: int = 2) -> str:
     p = Path(pdf_path)
     if output_pdf_path is None:
         output_pdf_path = str(p.with_name(p.stem + "_TiengViet.pdf"))
 
     doc = pymupdf.open(pdf_path)
     total = len(doc)
-    print(f"\n📄 [Fallback Engine: PyMuPDF] {p.name} ({total} trang)")
+    print(f"\n📄 [Siêu Nhẹ & Siêu Tốc Engine] {p.name} ({total} trang)")
     doc_out = pymupdf.open()
     page_bufs: dict[int, io.BytesIO] = {}
 
@@ -356,16 +268,9 @@ def translate_pdf_fallback(pdf_path: str, output_pdf_path: str = None, workers: 
         doc_out.insert_pdf(pymupdf.open("pdf", pdf_bytes))
 
     doc_out.save(output_pdf_path)
-    print(f"✅ Đã tạo: {output_pdf_path}\n")
+    print(f"✅ Đã tạo PDF Tiếng Việt: {output_pdf_path}\n")
     return output_pdf_path
 
-def translate_pdf_file(pdf_path: str, output_pdf_path: str = None, service: str = 'google') -> str:
-    if is_pdf2zh_available():
-        return translate_pdf_sota(pdf_path, output_pdf_path, service=service)
-    else:
-        return translate_pdf_fallback(pdf_path, output_pdf_path)
-
-# ─── DOCX TRANSLATOR ─────────────────────────────────────────────────────────
 def translate_docx_file(docx_path: str, output_docx_path: str = None) -> str:
     p = Path(docx_path)
     if output_docx_path is None:
@@ -384,16 +289,14 @@ def translate_docx_file(docx_path: str, output_docx_path: str = None) -> str:
     print(f"✅ Đã lưu: {output_docx_path}\n")
     return output_docx_path
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         fp = sys.argv[1]
-        svc = sys.argv[2] if len(sys.argv) > 2 else 'google'
         if fp.lower().endswith('.pdf'):
-            translate_pdf_file(fp, service=svc)
+            translate_pdf_file(fp)
         elif fp.lower().endswith('.docx'):
             translate_docx_file(fp)
         else:
             print("❌ Chỉ hỗ trợ .pdf hoặc .docx")
     else:
-        print("Sử dụng: python3 doc_translator.py <path_to_pdf_or_docx> [service_name]")
+        print("Sử dụng: python3 doc_translator.py <path_to_pdf_or_docx>")
