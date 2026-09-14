@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 sub_doc_app.py - GUI dịch phụ đề & tài liệu sang Tiếng Việt
-Phiên bản 3.0 - Tối ưu: Progress bar, mở file đầu ra, batch PDF, canh chỉnh font
+v4.0 - Integrated Engine Selector (Google / Gemini Cloud API / Local AI), Progress Bar, SOTA Layout
 """
-import os, sys, glob, subprocess, threading
+import os, sys, glob, subprocess, threading, json
+from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
@@ -15,23 +16,92 @@ from doc_translator import translate_pdf_file, translate_docx_file
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+CONFIG_PATH = Path.home() / ".config" / "viet-translator" / "config.json"
+
+def load_config() -> dict:
+    try:
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"engine": "google", "gemini_key": ""}
+
+def save_config(cfg: dict):
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 class TranslatorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Bộ Dịch Phụ Đề & Tài Liệu (Eng/Rus ➔ Tiếng Việt)")
-        self.geometry("800x650")
-        self.minsize(700, 580)
+        self.title("Bộ Dịch Phụ Đề & Sách Ngoại Văn (Eng/Rus ➔ Tiếng Việt)")
+        self.geometry("820x720")
+        self.minsize(720, 620)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.cfg = load_config()
 
         # ── Header ──────────────────────────────────────────────────────────
         hf = ctk.CTkFrame(self, corner_radius=12)
         hf.pack(padx=20, pady=(15, 5), fill="x")
-        ctk.CTkLabel(hf, text="🎬 BỘ DỊCH PHỤ ĐỀ & TÀI LIỆU SANG TIẾNG VIỆT",
-                     font=ctk.CTkFont(size=19, weight="bold")).pack(pady=(10, 2))
-        ctk.CTkLabel(hf, text="Tự động dịch .srt · .pdf (giữ hình ảnh + bố cục) · .docx  |  Xem video kèm sub Tiếng Việt",
+        ctk.CTkLabel(hf, text="🎬 BỘ DỊCH PHỤ ĐỀ & SÁCH NGOẠI VĂN SANG TIẾNG VIỆT",
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(10, 2))
+        ctk.CTkLabel(hf, text="SOTA Layout (pdf2zh + DocLayout-YOLO) · Phụ đề .srt · .docx  |  Chế độ Dịch Sách Cao Cấp",
                      font=ctk.CTkFont(size=12), text_color="gray70").pack(pady=(0, 10))
+
+        # ── Engine Selection Frame ─────────────────────────────────────────
+        ef = ctk.CTkFrame(self, corner_radius=10, fg_color="#1e222a")
+        ef.pack(padx=20, pady=5, fill="x")
+
+        ctk.CTkLabel(ef, text="⚙️ LỰA CHỌN ENGINE DỊCH (Tự do tùy chọn trước mỗi lượt dịch):",
+                     font=ctk.CTkFont(size=12, weight="bold"), text_color="#38d9a9").pack(anchor="w", padx=12, pady=(8, 4))
+
+        radio_frame = ctk.CTkFrame(ef, fg_color="transparent")
+        radio_frame.pack(fill="x", padx=10, pady=2)
+
+        self.engine_var = tk.StringVar(value=self.cfg.get("engine", "google"))
+
+        r1 = ctk.CTkRadioButton(
+            radio_frame, text="⚡ Google Translate (Miễn phí - Nhanh, không cần Key)",
+            variable=self.engine_var, value="google", command=self._on_engine_change
+        )
+        r1.pack(side="left", padx=10, pady=4)
+
+        r2 = ctk.CTkRadioButton(
+            radio_frame, text="🔑 Gemini Cloud API (Dịch Sách Cao Cấp - Chuẩn mượt)",
+            variable=self.engine_var, value="gemini", command=self._on_engine_change
+        )
+        r2.pack(side="left", padx=10, pady=4)
+
+        r3 = ctk.CTkRadioButton(
+            radio_frame, text="🔒 Local AI / Ollama (Offline)",
+            variable=self.engine_var, value="ollama", command=self._on_engine_change
+        )
+        r3.pack(side="left", padx=10, pady=4)
+
+        # API Key Entry Row (collapsible / enabled when Gemini chosen)
+        self.key_frame = ctk.CTkFrame(ef, fg_color="transparent")
+        self.key_frame.pack(fill="x", padx=12, pady=(2, 8))
+
+        ctk.CTkLabel(self.key_frame, text="🔑 Gemini API Key:", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 6))
+        self.key_entry = ctk.CTkEntry(self.key_frame, placeholder_text="Nhập API Key miễn phí từ Google...", width=320)
+        self.key_entry.insert(0, self.cfg.get("gemini_key", ""))
+        self.key_entry.pack(side="left", padx=4)
+
+        btn_get_key = ctk.CTkButton(
+            self.key_frame, text="🔗 Lấy Key Miễn Phí (1-Click)", width=170,
+            fg_color="#0c8599", hover_color="#0b7285", font=ctk.CTkFont(size=11),
+            command=self._open_gemini_key_page
+        )
+        btn_get_key.pack(side="left", padx=6)
+
+        self._on_engine_change()
 
         # ── Progress bar (always visible below header) ───────────────────────
         self._progress_var = tk.DoubleVar(value=0)
@@ -44,17 +114,42 @@ class TranslatorApp(ctk.CTk):
         self.tabview = ctk.CTkTabview(self)
         self.tabview.pack(padx=20, pady=6, fill="both", expand=True)
 
-        self._setup_batch_tab(self.tabview.add("📂 Dịch Toàn Bộ Phụ Đề Thư Mục"))
-        self._setup_file_tab(self.tabview.add("📄 Dịch 1 File (Sub / PDF / Word)"))
-        self._setup_pdf_batch_tab(self.tabview.add("📋 Dịch Toàn Bộ PDF Thư Mục"))
+        self._setup_batch_tab(self.tabview.add("📂 Dịch Phụ Đề Thư Mục"))
+        self._setup_file_tab(self.tabview.add("📄 Dịch 1 File (Sub / PDF / Sách / Word)"))
+        self._setup_pdf_batch_tab(self.tabview.add("📋 Dịch PDF / Sách Thư Mục"))
         self._setup_play_tab(self.tabview.add("▶️ Xem Video Kèm Sub"))
 
         # ── Log box ──────────────────────────────────────────────────────────
         lf = ctk.CTkFrame(self, corner_radius=8)
         lf.pack(padx=20, pady=(4, 14), fill="x")
         ctk.CTkLabel(lf, text="Nhật ký tiến trình:", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(6, 0))
-        self.log_box = ctk.CTkTextbox(lf, height=110, font=ctk.CTkFont(family="monospace", size=11))
+        self.log_box = ctk.CTkTextbox(lf, height=100, font=ctk.CTkFont(family="monospace", size=11))
         self.log_box.pack(padx=10, pady=6, fill="x")
+
+    def _open_gemini_key_page(self):
+        try:
+            subprocess.Popen(["xdg-open", "https://aistudio.google.com/app/apikey"])
+        except Exception:
+            pass
+
+    def _on_engine_change(self):
+        eng = self.engine_var.get()
+        self.cfg["engine"] = eng
+        save_config(self.cfg)
+        if eng == "gemini":
+            self.key_entry.configure(state="normal")
+        else:
+            # Leave entry readable
+            self.key_entry.configure(state="normal")
+
+    def get_selected_service((self) -> str:
+        eng = self.engine_var.get()
+        key = self.key_entry.get().strip()
+        if key:
+            os.environ["GEMINI_API_KEY"] = key
+            self.cfg["gemini_key"] = key
+            save_config(self.cfg)
+        return eng
 
     # ── Helpers ─────────────────────────────────────────────────────────────
     def _on_close(self):
@@ -67,7 +162,6 @@ class TranslatorApp(ctk.CTk):
         self.after(0, _do)
 
     def set_progress(self, value: float, label: str = ""):
-        """value: 0.0 – 1.0"""
         def _do():
             self._progress_var.set(value)
             if label:
@@ -75,14 +169,12 @@ class TranslatorApp(ctk.CTk):
         self.after(0, _do)
 
     def _open_file(self, path: str):
-        """Open a file with the system default app."""
         try:
             subprocess.Popen(["xdg-open", path])
         except Exception as e:
             self.log(f"⚠️ Không thể mở file: {e}")
 
     def _result_banner(self, parent, text, path, fg="#2b8a3e"):
-        """Show a success banner with Open button."""
         def _do():
             if hasattr(self, '_result_frame') and self._result_frame.winfo_exists():
                 self._result_frame.destroy()
@@ -99,7 +191,7 @@ class TranslatorApp(ctk.CTk):
     # TAB 1: Batch Subtitle
     # ════════════════════════════════════════════════════════════════════════
     def _setup_batch_tab(self, tab):
-        ctk.CTkLabel(tab, text="Chọn thư mục chứa phụ đề (.srt) của khóa học:",
+        ctk.CTkLabel(tab, text="Chọn thư mục chứa phụ đề (.srt) của khóa học/phim:",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=15, pady=(15, 4))
 
         ff = ctk.CTkFrame(tab)
@@ -157,7 +249,7 @@ class TranslatorApp(ctk.CTk):
     # TAB 2: Single File
     # ════════════════════════════════════════════════════════════════════════
     def _setup_file_tab(self, tab):
-        ctk.CTkLabel(tab, text="Chọn 1 file để dịch:",
+        ctk.CTkLabel(tab, text="Chọn 1 file để dịch (PDF / Phụ đề / Sách / Word):",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=15, pady=(15, 4))
 
         ff = ctk.CTkFrame(tab)
@@ -167,13 +259,13 @@ class TranslatorApp(ctk.CTk):
         ctk.CTkButton(ff, text="📂 Chọn File", command=self._browse_file, width=120).pack(side="right", padx=8, pady=10)
 
         self.btn_file = ctk.CTkButton(
-            tab, text="✨ DỊCH FILE NÀY SANG TIẾNG VIỆT (GIỮ HÌNH ẢNH & BỐ CỤC)",
+            tab, text="✨ DỊCH FILE NÀY SANG TIẾNG VIỆT (SOTA LAYOUT ENGINE)",
             fg_color="#2b8a3e", hover_color="#1b5e28",
             font=ctk.CTkFont(size=14, weight="bold"), height=44,
             command=self._start_file_translation)
         self.btn_file.pack(padx=15, pady=15, fill="x")
 
-        self._file_tab_ref = tab  # save ref for result banner
+        self._file_tab_ref = tab
 
     def _browse_file(self):
         fp = filedialog.askopenfilename(
@@ -187,20 +279,21 @@ class TranslatorApp(ctk.CTk):
         fp = self.file_entry.get().strip()
         if not fp or not os.path.exists(fp):
             messagebox.showerror("Lỗi", "Vui lòng chọn file hợp lệ!"); return
+        svc = self.get_selected_service()
         self.btn_file.configure(state="disabled")
-        threading.Thread(target=self._run_file_translation, args=(fp,), daemon=True).start()
+        threading.Thread(target=self._run_file_translation, args=(fp, svc), daemon=True).start()
 
-    def _run_file_translation(self, fp):
+    def _run_file_translation(self, fp, svc):
         try:
             self.set_progress(0.1, f"Đang xử lý: {os.path.basename(fp)}")
-            self.log(f"✨ Bắt đầu dịch: {fp}")
+            self.log(f"✨ Bắt đầu dịch ({svc.upper()} Engine): {fp}")
             ext = fp.lower()
             if ext.endswith(".srt") or ext.endswith(".vtt"):
                 out = translate_srt_file(fp)
                 msg = f"Đã dịch xong phụ đề!\nFile lưu tại:\n{out}"
             elif ext.endswith(".pdf"):
-                out = translate_pdf_file(fp)
-                msg = f"Đã dịch xong PDF!\nFile lưu tại:\n{out}"
+                out = translate_pdf_file(fp, service=svc)
+                msg = f"Đã dịch xong PDF (SOTA Layout)!\nFile lưu tại:\n{out}"
             elif ext.endswith(".docx"):
                 out = translate_docx_file(fp)
                 msg = f"Đã dịch xong Word!\nFile lưu tại:\n{out}"
@@ -222,7 +315,7 @@ class TranslatorApp(ctk.CTk):
     # TAB 3: Batch PDF
     # ════════════════════════════════════════════════════════════════════════
     def _setup_pdf_batch_tab(self, tab):
-        ctk.CTkLabel(tab, text="Chọn thư mục chứa các file PDF muốn dịch:",
+        ctk.CTkLabel(tab, text="Chọn thư mục chứa các file PDF/Sách muốn dịch:",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=15, pady=(15, 4))
 
         ff = ctk.CTkFrame(tab)
@@ -253,23 +346,24 @@ class TranslatorApp(ctk.CTk):
         folder = self.pdf_folder_entry.get().strip()
         if not folder or not os.path.exists(folder):
             messagebox.showerror("Lỗi", "Vui lòng chọn thư mục hợp lệ!"); return
+        svc = self.get_selected_service()
         self.btn_pdf_batch.configure(state="disabled")
-        threading.Thread(target=self._run_batch_pdf, args=(folder,), daemon=True).start()
+        threading.Thread(target=self._run_batch_pdf, args=(folder, svc), daemon=True).start()
 
-    def _run_batch_pdf(self, folder):
+    def _run_batch_pdf(self, folder, svc):
         files = [f for f in glob.glob(os.path.join(folder, "**", "*.pdf"), recursive=True)
-                 if "_TiengViet" not in f]
+                 if "_TiengViet" not in f and not f.endswith(".mono.pdf") and not f.endswith(".dual.pdf")]
         if not files:
             self.log("⚠️ Không tìm thấy file PDF nào cần dịch!")
             self.after(0, lambda: self.btn_pdf_batch.configure(state="normal")); return
 
-        self.log(f"📌 Tìm thấy {len(files)} file PDF → bắt đầu dịch...")
+        self.log(f"📌 Tìm thấy {len(files)} file PDF → bắt đầu dịch ({svc.upper()})...")
         ok = 0
         for i, path in enumerate(files, 1):
             try:
                 self.set_progress(i / len(files), f"PDF {i}/{len(files)}: {os.path.basename(path)}")
                 self.log(f"[{i}/{len(files)}] {os.path.basename(path)}")
-                translate_pdf_file(path)
+                translate_pdf_file(path, service=svc)
                 ok += 1
             except Exception as e:
                 self.log(f"  ❌ Lỗi: {e}")
@@ -333,7 +427,7 @@ class TranslatorApp(ctk.CTk):
                 if sub: cmd.append(f"--sub-file={sub}")
             subprocess.Popen(cmd)
         except Exception as e:
-            self.log(f"❌ Không mở được trình phát: {e}")
+            self.log(f"❌ Không mở me: {e}")
 
 
 if __name__ == "__main__":
